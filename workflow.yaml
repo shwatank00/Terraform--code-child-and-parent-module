@@ -1,0 +1,580 @@
+name: Terraform Azure CI/CD
+
+# ============================================================
+# PIPELINE TRIGGERS
+# ============================================================
+
+on:
+
+  # Run when code is pushed to main or feature branches
+  push:
+    branches:
+      - main
+      - "feature/**"
+
+  # Run when Pull Request is created/updated against main
+  pull_request:
+    branches:
+      - main
+
+
+# ============================================================
+# GITHUB ACTIONS PERMISSIONS
+# ============================================================
+
+permissions:
+  contents: read
+
+  # Required for Azure OIDC authentication
+  id-token: write
+
+
+# ============================================================
+# GLOBAL VARIABLES
+# ============================================================
+
+env:
+
+  # Terraform environment directory
+  TF_WORKING_DIR: ./Environment/Non-Prod
+
+  # Terraform version
+  TF_VERSION: "1.9.8"
+
+  # Azure Key Vault name
+  KEYVAULT_NAME: ${{ secrets.KEYVAULT_NAME }}
+
+
+# ============================================================
+# JOB 1
+# TERRAFORM VALIDATION
+#
+# Runs on:
+#   - feature branch
+#   - main
+#   - pull request
+# ============================================================
+
+jobs:
+
+  terraform-validation:
+
+    name: Terraform Validation / TFLint / TFSec
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # --------------------------------------------------------
+      # 1. Checkout Terraform repository
+      # --------------------------------------------------------
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # 2. Install Terraform
+      # --------------------------------------------------------
+
+      - name: Setup Terraform
+
+        uses: hashicorp/setup-terraform@v3
+
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+
+      # --------------------------------------------------------
+      # 3. Terraform Format Check
+      # --------------------------------------------------------
+
+      - name: Terraform Format Check
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          terraform fmt -check -recursive
+
+
+      # --------------------------------------------------------
+      # 4. Terraform Init
+      # --------------------------------------------------------
+
+      - name: Terraform Init
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          terraform init -input=false
+
+
+      # --------------------------------------------------------
+      # 5. Terraform Validate
+      # --------------------------------------------------------
+
+      - name: Terraform Validate
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          terraform validate
+
+
+      # --------------------------------------------------------
+      # 6. Install TFLint
+      # --------------------------------------------------------
+
+      - name: Setup TFLint
+
+        uses: terraform-linters/setup-tflint@v4
+
+
+      # --------------------------------------------------------
+      # 7. TFLint Init
+      # --------------------------------------------------------
+
+      - name: TFLint Init
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          tflint --init
+
+
+      # --------------------------------------------------------
+      # 8. Run TFLint
+      # --------------------------------------------------------
+
+      - name: Run TFLint
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          tflint --recursive
+
+
+      # --------------------------------------------------------
+      # 9. Run TFSec
+      # --------------------------------------------------------
+
+      - name: Run TFSec
+
+        uses: aquasecurity/tfsec-action@v1.0.3
+
+        with:
+          working_directory: ${{ env.TF_WORKING_DIR }}
+          soft_fail: false
+
+
+  # ============================================================
+  # JOB 2
+  # TERRAFORM PLAN
+  #
+  # Runs on:
+  #   - feature branch
+  #   - main
+  #   - pull request
+  # ============================================================
+
+  terraform-plan:
+
+    name: Terraform Plan
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - terraform-validation
+
+
+    # ----------------------------------------------------------
+    # Plan condition
+    # ----------------------------------------------------------
+
+    if: |
+      github.event_name == 'pull_request' ||
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/feature/')
+
+
+    # ----------------------------------------------------------
+    # Permissions for OIDC
+    # ----------------------------------------------------------
+
+    permissions:
+
+      contents: read
+
+      id-token: write
+
+
+    steps:
+
+      # --------------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------------
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # 2. Setup Terraform
+      # --------------------------------------------------------
+
+      - name: Setup Terraform
+
+        uses: hashicorp/setup-terraform@v3
+
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+
+      # --------------------------------------------------------
+      # 3. Azure Login
+      #
+      # IMPORTANT:
+      # This uses OIDC.
+      #
+      # No Azure client secret is required.
+      # --------------------------------------------------------
+
+      - name: Azure Login
+
+        uses: azure/login@v2
+
+        with:
+
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+
+      # --------------------------------------------------------
+      # 4. Verify Azure Login
+      # --------------------------------------------------------
+
+      - name: Verify Azure Login
+
+        uses: azure/cli@v2
+
+        with:
+
+          inlineScript: |
+
+            az account show
+
+
+      # --------------------------------------------------------
+      # 5. Retrieve Terraform Secrets from Azure Key Vault
+      #
+      # Example secrets:
+      #
+      #   terraform-client-id
+      #   terraform-tenant-id
+      #   terraform-subscription-id
+      #
+      # IMPORTANT:
+      # We do NOT print secret values.
+      # --------------------------------------------------------
+
+      - name: Get secrets from Azure Key Vault
+
+        id: keyvault
+
+        uses: azure/cli@v2
+
+        with:
+
+          inlineScript: |
+
+            echo "Reading Terraform secrets from Azure Key Vault..."
+
+            TF_CLIENT_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-client-id" \
+              --query value \
+              --output tsv)
+
+            TF_TENANT_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-tenant-id" \
+              --query value \
+              --output tsv)
+
+            TF_SUBSCRIPTION_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-subscription-id" \
+              --query value \
+              --output tsv)
+
+
+            # Mask values in GitHub Actions logs
+
+            echo "::add-mask::$TF_CLIENT_ID"
+            echo "::add-mask::$TF_TENANT_ID"
+            echo "::add-mask::$TF_SUBSCRIPTION_ID"
+
+
+            # Make values available to later steps
+
+            echo "TF_CLIENT_ID=$TF_CLIENT_ID" >> $GITHUB_ENV
+            echo "TF_TENANT_ID=$TF_TENANT_ID" >> $GITHUB_ENV
+            echo "TF_SUBSCRIPTION_ID=$TF_SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+
+      # --------------------------------------------------------
+      # 6. Terraform Init
+      # --------------------------------------------------------
+
+      - name: Terraform Init
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          terraform init -input=false
+
+
+      # --------------------------------------------------------
+      # 7. Terraform Plan
+      # --------------------------------------------------------
+
+      - name: Terraform Plan
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        env:
+
+          # Terraform Azure authentication
+          ARM_CLIENT_ID: ${{ env.TF_CLIENT_ID }}
+
+          ARM_TENANT_ID: ${{ env.TF_TENANT_ID }}
+
+          ARM_SUBSCRIPTION_ID: ${{ env.TF_SUBSCRIPTION_ID }}
+
+          # Terraform uses OIDC
+          ARM_USE_OIDC: true
+
+        run: |
+
+          terraform plan \
+            -input=false \
+            -out=tfplan
+
+
+      # --------------------------------------------------------
+      # 8. Upload Terraform Plan
+      # --------------------------------------------------------
+
+      - name: Upload Terraform Plan
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: terraform-plan
+
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+
+
+  # ============================================================
+  # JOB 3
+  # TERRAFORM APPLY
+  #
+  # ONLY runs after:
+  #
+  #   Validation SUCCESS
+  #   Plan SUCCESS
+  #   Branch = main
+  #   Event = push
+  # ============================================================
+
+  terraform-apply:
+
+    name: Terraform Apply
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - terraform-plan
+
+
+    # ----------------------------------------------------------
+    # Apply ONLY on main
+    # ----------------------------------------------------------
+
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push'
+
+
+    permissions:
+
+      contents: read
+
+      id-token: write
+
+
+    # ----------------------------------------------------------
+    # GitHub Environment
+    #
+    # You can configure approval for this environment.
+    # ----------------------------------------------------------
+
+    environment:
+
+      name: non-prod
+
+
+    steps:
+
+      # --------------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------------
+
+      - name: Checkout repository
+
+        uses: actions/checkout@v4
+
+
+      # --------------------------------------------------------
+      # 2. Setup Terraform
+      # --------------------------------------------------------
+
+      - name: Setup Terraform
+
+        uses: hashicorp/setup-terraform@v3
+
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+
+      # --------------------------------------------------------
+      # 3. Azure Login using OIDC
+      # --------------------------------------------------------
+
+      - name: Azure Login
+
+        uses: azure/login@v2
+
+        with:
+
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+
+      # --------------------------------------------------------
+      # 4. Verify Azure Login
+      # --------------------------------------------------------
+
+      - name: Verify Azure Login
+
+        uses: azure/cli@v2
+
+        with:
+
+          inlineScript: |
+
+            az account show
+
+
+      # --------------------------------------------------------
+      # 5. Get Terraform credentials from Key Vault
+      # --------------------------------------------------------
+
+      - name: Get secrets from Azure Key Vault
+
+        uses: azure/cli@v2
+
+        with:
+
+          inlineScript: |
+
+            TF_CLIENT_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-client-id" \
+              --query value \
+              --output tsv)
+
+            TF_TENANT_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-tenant-id" \
+              --query value \
+              --output tsv)
+
+            TF_SUBSCRIPTION_ID=$(az keyvault secret show \
+              --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+              --name "terraform-subscription-id" \
+              --query value \
+              --output tsv)
+
+
+            echo "::add-mask::$TF_CLIENT_ID"
+            echo "::add-mask::$TF_TENANT_ID"
+            echo "::add-mask::$TF_SUBSCRIPTION_ID"
+
+
+            echo "TF_CLIENT_ID=$TF_CLIENT_ID" >> $GITHUB_ENV
+            echo "TF_TENANT_ID=$TF_TENANT_ID" >> $GITHUB_ENV
+            echo "TF_SUBSCRIPTION_ID=$TF_SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+
+      # --------------------------------------------------------
+      # 6. Terraform Init
+      # --------------------------------------------------------
+
+      - name: Terraform Init
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        run: |
+          terraform init -input=false
+
+
+      # --------------------------------------------------------
+      # 7. Download Terraform Plan
+      # --------------------------------------------------------
+
+      - name: Download Terraform Plan
+
+        uses: actions/download-artifact@v4
+
+        with:
+
+          name: terraform-plan
+
+          path: ${{ env.TF_WORKING_DIR }}
+
+
+      # --------------------------------------------------------
+      # 8. Terraform Apply
+      # --------------------------------------------------------
+
+      - name: Terraform Apply
+
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+        env:
+
+          ARM_CLIENT_ID: ${{ env.TF_CLIENT_ID }}
+
+          ARM_TENANT_ID: ${{ env.TF_TENANT_ID }}
+
+          ARM_SUBSCRIPTION_ID: ${{ env.TF_SUBSCRIPTION_ID }}
+
+          ARM_USE_OIDC: true
+
+        run: |
+
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+```
